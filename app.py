@@ -4,7 +4,8 @@ A simple interface to chat with YouTube videos using RAG
 """
 
 import streamlit as st
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -17,6 +18,7 @@ from langchain_core.runnables import (
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 import re
+import json
 
 # Page config
 st.set_page_config(page_title="YouTube Chat", page_icon="🎥", layout="wide")
@@ -45,6 +47,106 @@ st.markdown(
     '<p style="text-align: center; color: gray;">Ask questions about any YouTube video with transcripts</p>',
     unsafe_allow_html=True,
 )
+
+
+def fetch_transcript_standard(video_id):
+    """Method 1: Standard YouTube Transcript API"""
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.fetch(video_id, languages=["en"])
+        transcript = " ".join(chunk.text for chunk in transcript_list)
+        return transcript, "Standard API"
+    except Exception as e:
+        raise e
+
+
+def fetch_transcript_ytdlp(video_id):
+    """Method 2: yt-dlp (works on Streamlit Cloud!)"""
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en"],
+            "subtitlesformat": "json3",
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            # Check if subtitles are available
+            if not info.get("subtitles") and not info.get("automatic_captions"):
+                raise Exception("No captions available")
+
+            # Try manual subtitles first, then automatic
+            subtitles = info.get("subtitles", {}).get("en") or info.get(
+                "automatic_captions", {}
+            ).get("en")
+
+            if not subtitles:
+                raise Exception("No English captions found")
+
+            # Find json3 format
+            subtitle_url = None
+            for sub in subtitles:
+                if sub.get("ext") == "json3":
+                    subtitle_url = sub.get("url")
+                    break
+
+            if not subtitle_url:
+                raise Exception("Could not find subtitle URL")
+
+            # Download and parse subtitles
+            import urllib.request
+
+            with urllib.request.urlopen(subtitle_url) as response:
+                data = json.loads(response.read().decode())
+
+            # Extract text from json3 format
+            transcript_parts = []
+            for event in data.get("events", []):
+                if "segs" in event:
+                    for seg in event["segs"]:
+                        if "utf8" in seg:
+                            transcript_parts.append(seg["utf8"])
+
+            transcript = " ".join(transcript_parts)
+
+            if not transcript:
+                raise Exception("Failed to extract transcript text")
+
+            return transcript, "yt-dlp"
+
+    except Exception as e:
+        raise e
+
+
+def fetch_transcript_with_fallback(video_id):
+    """Try multiple methods to fetch transcript"""
+    errors = []
+
+    # Method 1: Try standard API first (faster)
+    try:
+        transcript, source = fetch_transcript_standard(video_id)
+        return transcript, source
+    except Exception as e:
+        errors.append(f"Standard API: {str(e)}")
+
+    # Method 2: Try yt-dlp (works on Streamlit Cloud)
+    try:
+        transcript, source = fetch_transcript_ytdlp(video_id)
+        return transcript, source
+    except Exception as e:
+        errors.append(f"yt-dlp: {str(e)}")
+
+    # All methods failed
+    error_msg = "\n".join(errors)
+    raise Exception(f"All methods failed:\n{error_msg}")
+
 
 # Sidebar for configuration
 with st.sidebar:
@@ -96,6 +198,7 @@ with st.sidebar:
     - **LangChain** for RAG pipeline
     - **FAISS** for vector search
     - **HuggingFace** for embeddings
+    - **yt-dlp** for reliable transcripts
     """
     )
 
@@ -142,14 +245,13 @@ with col1:
         else:
             with st.spinner("Loading transcript..."):
                 try:
-                    # Fetch transcript
-                    ytt_api = YouTubeTranscriptApi()
-                    transcript_list = ytt_api.fetch(video_id, languages=["en"])
-                    transcript = " ".join(chunk.text for chunk in transcript_list)
+                    # Try to fetch transcript
+                    transcript, source = fetch_transcript_with_fallback(video_id)
 
                     # Store in session state with video ID
                     st.session_state.transcript = transcript
                     st.session_state.current_video_id = video_id
+                    st.session_state.transcript_source = source
 
                     # Clear old RAG components to rebuild with new video
                     if "chain" in st.session_state:
@@ -157,19 +259,32 @@ with col1:
                     if "messages" in st.session_state:
                         st.session_state.messages = []
 
-                    st.success(f"✅ Transcript loaded! ({len(transcript)} characters)")
+                    st.success(
+                        f"✅ Transcript loaded via {source}! ({len(transcript)} characters)"
+                    )
                     st.rerun()
 
-                except TranscriptsDisabled:
-                    st.error("❌ This video doesn't have captions available")
                 except Exception as e:
                     st.error(f"❌ Error loading transcript: {str(e)}")
+                    st.warning(
+                        """
+                    **Troubleshooting:**
+                    - ✅ Make sure the video has English captions/subtitles
+                    - 🎥 Try a different video
+                    - 🔒 Check the video is not age-restricted or private
+                    - 🌐 Some videos may block automated access
+                    """
+                    )
 
 with col2:
     st.subheader("💬 Chat")
 
     # Check if transcript is loaded
     if "transcript" in st.session_state:
+        # Show transcript source
+        if "transcript_source" in st.session_state:
+            st.caption(f"📡 Transcript source: {st.session_state.transcript_source}")
+
         # First, check if we have API key
         if "api_key" not in st.session_state or not st.session_state.api_key:
             # Show API key input
